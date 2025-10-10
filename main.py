@@ -53,7 +53,9 @@ def main(cfg):
     test_script_stdout = "best_code_overall_val_stdout.txt"
     logging.info(f"Running validation script...: {print_hyperlink(test_script)}")
     with open(test_script_stdout, 'w') as stdout:
-        subprocess.run(["python", test_script, "-1", ROOT_DIR, "val"], stdout=stdout)
+        # subprocess.run(["python", test_script, "-1", ROOT_DIR, "val"], stdout=stdout)
+        import sys
+        subprocess.run([sys.executable, test_script, "-1", ROOT_DIR, "val"], stdout=stdout)
     logging.info(f"Validation script finished. Results are saved in {print_hyperlink(test_script_stdout)}.")
     
     # Print the results
