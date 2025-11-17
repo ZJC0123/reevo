@@ -17,6 +17,7 @@ def main(cfg):
     logging.info(f"Project Root: {print_hyperlink(ROOT_DIR)}")
     logging.info(f"Using LLM: {cfg.get('model', cfg.llm_client.model)}")
     logging.info(f"Using Algorithm: {cfg.algorithm}")
+    logging.info(f"Strict Reflection Mode: {cfg.strict_reflection_mode}")
 
     client = init_client(cfg)
     # optional clients for operators (ReEvo)

@@ -8,6 +8,10 @@ from omegaconf import DictConfig
 from utils.utils import *
 from utils.llm_client.base import BaseClient
 
+import json
+def write_to_my_log(data):
+    with open("analysis_log.json", "a") as f:
+        json.dump(data, f, ensure_ascii=False, indent=4)  
 
 class ReEvo:
     def __init__(
@@ -46,6 +50,18 @@ class ReEvo:
         
         self.init_prompt()
         self.init_population()
+        self.my_log = {"path":os.getcwd() ,"population": []}
+        self.my_log['strict_reflection_mode'] = self.strict_reflection_mode
+        for ind in self.population:
+            self.my_log["population"].append({
+                "response_id": ind["response_id"],
+                "code_path": ind["code_path"],
+                "obj": ind["obj"],
+                "exec_success": ind["exec_success"],
+                "traceback_msg": ind.get("traceback_msg", ""),
+                "iteration": self.iteration,
+                "generated_by": "initial_population",
+            })
 
 
     def init_prompt(self) -> None:
@@ -55,11 +71,13 @@ class ReEvo:
         self.func_name = self.cfg.problem.func_name
         self.obj_type = self.cfg.problem.obj_type
         self.problem_type = self.cfg.problem.problem_type
+        self.strict_reflection_mode = self.cfg.get('strict_reflection_mode', 0)  # Add this line
         
         logging.info("Problem: " + self.problem)
         logging.info("Problem description: " + self.problem_desc)
         logging.info("Function name: " + self.func_name)
-        
+        logging.info("Strict Reflection Mode(crossover, mutation): " + str(self.strict_reflection_mode))
+
         self.prompt_dir = f"{self.root_dir}/prompts"
         self.output_file = f"{self.root_dir}/problems/{self.problem}/gpt.py"
         
@@ -84,6 +102,13 @@ class ReEvo:
         self.user_reflector_lt_prompt = file_to_string(f'{self.prompt_dir}/common/user_reflector_lt.txt') # long-term reflection
         self.crossover_prompt = file_to_string(f'{self.prompt_dir}/common/crossover.txt')
         self.mutation_prompt = file_to_string(f'{self.prompt_dir}/common/mutation.txt')
+        # 向 crossover_prompt 和 mutation_prompt 加入尽量只按照 reflection 来修改代码
+        if int(self.strict_reflection_mode, 2) & 0b10:
+            self.crossover_prompt += "\nPlease make sure to strictly follow the reflections when performing crossover. Do not introduce any changes that are not mentioned in the reflections."
+        if int(self.strict_reflection_mode, 2) & 0b01:
+            self.mutation_prompt += "\nPlease make sure to strictly follow the reflections when performing mutation. Do not introduce any changes that are not mentioned in the reflections."
+        
+        
         self.user_generator_prompt = file_to_string(f'{self.prompt_dir}/common/user_generator.txt').format(
             func_name=self.func_name, 
             problem_desc=self.problem_desc,
@@ -224,6 +249,13 @@ class ReEvo:
                 population[response_id] = self.mark_invalid_individual(population[response_id], traceback_msg)
 
             logging.info(f"Iteration {self.iteration}, response_id {response_id}: Objective value: {individual['obj']}")
+        if hasattr(self, 'my_log'):
+            for ind in population:
+                for ml_ind in self.my_log["population"]:
+                    if ind["response_id"] == ml_ind["response_id"] and ind["code_path"] == ml_ind["code_path"] and ml_ind["iteration"] == self.iteration:
+                        ml_ind["obj"] = ind["obj"]
+                        ml_ind["exec_success"] = ind["exec_success"]
+                        ml_ind["traceback_msg"] = ind.get("traceback_msg", "")
         return population
 
 
@@ -363,14 +395,19 @@ class ReEvo:
         """
         Short-term reflection before crossovering two individuals.
         """
+        self.my_log['reflection'] = self.my_log.get('reflection', []) + [{'iteration': self.iteration, 'type': 'short_term', 'values': []}]
+
         messages_lst = []
         worse_code_lst = []
         better_code_lst = []
+        parent_1_list = []
+        parent_2_list = []
         for i in range(0, len(population), 2):
             # Select two individuals
             parent_1 = population[i]
             parent_2 = population[i+1]
-            
+            parent_1_list.append(parent_1)
+            parent_2_list.append(parent_2)
             # Short-term reflection
             messages, worse_code, better_code = self.gen_short_term_reflection_prompt(parent_1, parent_2)
             messages_lst.append(messages)
@@ -379,12 +416,21 @@ class ReEvo:
         
         # Asynchronously generate responses
         response_lst = self.short_reflector_llm.multi_chat_completion(messages_lst)
+        i = 0
+        for response in response_lst:
+            self.my_log['reflection'][-1]['values'].append({
+                'response': response,
+                'parent_1_code_path': parent_1_list[i]["code_path"],
+                'parent_2_code_path': parent_2_list[i]["code_path"],
+            })
+            i += 1
         return response_lst, worse_code_lst, better_code_lst
     
     def long_term_reflection(self, short_term_reflections: list[str]) -> None:
         """
         Long-term reflection before mutation.
         """
+        self.my_log['reflection'] = self.my_log.get('reflection', []) + [{'iteration': self.iteration, 'type': 'long_term', 'values': []}]
         system = self.system_reflector_prompt
         user = self.user_reflector_lt_prompt.format(
             problem_desc = self.problem_desc,
@@ -396,9 +442,13 @@ class ReEvo:
         if self.print_long_term_reflection_prompt:
             logging.info("Long-term Reflection Prompt: \nSystem Prompt: \n" + system + "\nUser Prompt: \n" + user)
             self.print_long_term_reflection_prompt = False
-        
+        # ？？？ 长期反思就没有历史的信息吗？更新掉了吗？
+        self.my_log['reflection'][-1]['values'].append({
+            'origin': self.long_term_reflection_str,
+            'short_term_refs': "\n".join(short_term_reflections)
+        })
         self.long_term_reflection_str = self.long_reflector_llm.multi_chat_completion([messages])[0]
-        
+        self.my_log['reflection'][-1]['values'][-1]['response'] = self.long_term_reflection_str
         # Write reflections to file
         file_name = f"problem_iter{self.iteration}_short_term_reflections.txt"
         with open(file_name, 'w') as file:
@@ -437,7 +487,17 @@ class ReEvo:
         # Asynchronously generate responses
         response_lst = self.crossover_llm.multi_chat_completion(messages_lst)
         crossed_population = [self.response_to_individual(response, response_id) for response_id, response in enumerate(response_lst)]
-
+        for i,ind in enumerate(crossed_population):
+            self.my_log["population"].append({
+                "response_id": ind["response_id"],
+                "code_path": ind["code_path"],
+                # "obj": ind["obj"],
+                # "exec_success": ind["exec_success"],
+                "traceback_msg": ind.get("traceback_msg", ""),
+                "iteration": self.iteration,
+                "generated_by": "crossover",
+                "parent_code_path": (self.my_log['reflection'][-1]['values'][i]['parent_1_code_path'], self.my_log['reflection'][-1]['values'][i]['parent_2_code_path']),
+            })
         assert len(crossed_population) == self.cfg.pop_size
         return crossed_population
 
@@ -459,6 +519,17 @@ class ReEvo:
             self.print_mutate_prompt = False
         responses = self.mutation_llm.multi_chat_completion([messages], int(self.cfg.pop_size * self.mutation_rate))
         population = [self.response_to_individual(response, response_id) for response_id, response in enumerate(responses)]
+        for ind in population:
+            self.my_log["population"].append({
+                "response_id": ind["response_id"],
+                "code_path": ind["code_path"],
+                # "obj": ind["obj"],
+                # "exec_success": ind["exec_success"],
+                "traceback_msg": ind.get("traceback_msg", ""),
+                "iteration": self.iteration,
+                "generated_by": "mutation",
+                "parent_code_path": self.elitist["code_path"],
+            })
         return population
 
 
@@ -488,5 +559,5 @@ class ReEvo:
             self.population.extend(self.evaluate_population(mutated_population))
             # Update
             self.update_iter()
-
+        write_to_my_log(self.my_log)
         return self.best_code_overall, self.best_code_path_overall
